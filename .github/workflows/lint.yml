@@ -1,0 +1,18 @@
+# Şablonun kendi denetimi. Mac runner bu depoya BAĞLANMAZ: depo public, fork PR'ları
+# self-hosted runner'da kod çalıştırabilirdi. Yalnız actionlint, ubuntu-latest.
+name: Lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color .github/workflows/*.yml examples/*.yml

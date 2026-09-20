@@ -1,0 +1,453 @@
+# EAS yerel derleme şablonu — GitHub Actions yeniden kullanılabilir iş akışı.
+#
+# Tüketici depo bunu `uses:` ile çağırır; job'lar, sıra ve artifact'ler burada tanımlıdır.
+# GitLab'daki eas-local-runner-template'in karşılığı. Kullanım ve girdiler: README.md.
+#
+# Akış: plan (hızlı denetim) → build (platform başına, eas build --local) → release (yalnız tag'de).
+# Tüketici şablon deposunu checkout etmez; betikler bu dosyada gömülü kalmak zorunda.
+
+name: EAS yerel derleme
+
+on:
+  workflow_call:
+    inputs:
+      platforms:
+        description: 'Virgülle ayrılmış: android, ios ya da android,ios'
+        type: string
+        default: android
+      profile:
+        description: 'eas.json build profili'
+        type: string
+        default: production
+      app-dir:
+        description: 'Uygulama kökü; monorepo için apps/mobile'
+        type: string
+        default: '.'
+      runs-on:
+        description: 'JSON dizi: ["self-hosted","macOS"], ["macos-15"] ya da Android için ["ubuntu-latest"]'
+        type: string
+        default: '["self-hosted","macOS"]'
+      eas-cli-version:
+        description: 'eas-cli sürümü; sabitlemek için 22.5.0 gibi'
+        type: string
+        default: latest
+      node-version:
+        type: string
+        default: '22'
+      java-version:
+        description: 'macOS: /usr/libexec/java_home -v ile seçilir'
+        type: string
+        default: '17'
+      package-manager:
+        description: 'Saptamayı ezer: bun, pnpm, yarn, npm'
+        type: string
+        default: ''
+      install-command:
+        description: 'Kurulum komutunun tamamını ezer; doluysa saptama yapılmaz'
+        type: string
+        default: ''
+      pnpm-version:
+        description: 'package.json packageManager alanı yoksa gerekir'
+        type: string
+        default: ''
+      clean-prebuild:
+        description: "Derlemeden önce expo prebuild --clean; yalnız native klasörleri commit'li projelerde"
+        type: boolean
+        default: false
+      release:
+        description: 'auto: ref tag ise GitHub Release. never: yalnız artifact'
+        type: string
+        default: auto
+      artifact-retention-days:
+        type: number
+        default: 7
+      timeout-minutes:
+        description: "build job'ı için"
+        type: number
+        default: 90
+      unlock-keychain:
+        description: 'Self-hosted Mac: login keychain kilidini aç (iOS). GitHub-hosted: false'
+        type: boolean
+        default: true
+      refresh-adhoc-profile:
+        description: 'iOS: --refresh-ad-hoc-provisioning-profile; ASC sırlarını ister'
+        type: boolean
+        default: false
+      apple-team-type:
+        description: 'EXPO_APPLE_TEAM_TYPE: INDIVIDUAL, COMPANY_OR_ORGANIZATION, IN_HOUSE'
+        type: string
+        default: INDIVIDUAL
+    secrets:
+      EXPO_TOKEN:
+        description: 'EAS kişisel erişim belirteci'
+        required: true
+      RUNNER_KC_PASSWORD:
+        description: 'Self-hosted Mac kullanıcı parolası (login keychain); iOS için'
+        required: false
+      ASC_KEY_BASE64:
+        description: 'App Store Connect API .p8, base64; yalnız refresh-adhoc-profile için'
+        required: false
+      ASC_KEY_ID:
+        required: false
+      ASC_ISSUER_ID:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+    outputs:
+      release-url:
+        description: 'Oluşturulan GitHub Release adresi; release job çalışmadıysa boş'
+        value: ${{ jobs.release.outputs.url }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) PLAN — uzun kurulum başlamadan hızlı düş: app-dir, eas.json, profil, platform adları.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Ön denetim
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      app-dir: ${{ steps.plan.outputs.app-dir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Girdileri ve eas.json'u denetle
+        id: plan
+        env:
+          APP_DIR: ${{ inputs.app-dir }}
+          PROFILE: ${{ inputs.profile }}
+          PLATFORMS: ${{ inputs.platforms }}
+        shell: bash
+        run: |
+          node - <<'EOF'
+          const fs = require('fs');
+          const fail = (m) => { console.log(`::error::${m}`); process.exit(1); };
+          const appDir = (process.env.APP_DIR || '.').replace(/\/+$/, '') || '.';
+          const profile = process.env.PROFILE;
+          const easPath = `${appDir}/eas.json`;
+          if (!fs.existsSync(easPath)) fail(`${easPath} yok — app-dir doğru mu?`);
+          const eas = JSON.parse(fs.readFileSync(easPath, 'utf8'));
+          if (!eas.build || !eas.build[profile]) fail(`eas.json içinde build.${profile} profili yok`);
+          const platforms = [...new Set((process.env.PLATFORMS || '').split(',').map((s) => s.trim()).filter(Boolean))];
+          if (!platforms.length) fail('platforms boş; android, ios ya da android,ios');
+          const bad = platforms.filter((p) => !['android', 'ios'].includes(p));
+          if (bad.length) fail(`bilinmeyen platform: ${bad.join(', ')} (android, ios)`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ platform: platforms })}\napp-dir=${appDir}\n`);
+          console.log(`✅ ${easPath} · profil ${profile} · platformlar ${platforms.join(', ')}`);
+          EOF
+
+  # ---------------------------------------------------------------------------
+  # 2) BUILD — platform başına eas build --local. Tek runner job'ları zaten sıraya alır.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Derleme (${{ matrix.platform }})
+    needs: plan
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      APP_DIR: ${{ needs.plan.outputs.app-dir }}
+      PLATFORM: ${{ matrix.platform }}
+      PROFILE: ${{ inputs.profile }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Runner servisinin login kabuğu yoktur: Homebrew ve bun PATH'te görünmez. JDK,
+      # Android SDK ve artık JVM daemon'ları da burada ele alınır. Gradle/Kotlin daemon'ları
+      # 2 saat ayakta kalıp GB'larca RAM tutar; pgrep adayları ps ile "gerçekten java mı"
+      # diye doğrulanır ki kabuk kendini öldürmesin.
+      - name: macOS runner hazırlığı
+        if: runner.os == 'macOS'
+        env:
+          JAVA_VERSION: ${{ inputs.java-version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for D in "$HOME/.bun/bin" /opt/homebrew/bin /usr/local/bin; do
+            [ -d "$D" ] && echo "$D" >> "$GITHUB_PATH"
+          done
+          if JH="$(/usr/libexec/java_home -v "$JAVA_VERSION" 2>/dev/null)"; then
+            echo "JAVA_HOME=$JH" >> "$GITHUB_ENV"
+            echo "$JH/bin" >> "$GITHUB_PATH"
+            echo "☕ JAVA_HOME=$JH"
+          else
+            echo "::error::JDK $JAVA_VERSION bulunamadı (brew install openjdk@$JAVA_VERSION)"
+            exit 1
+          fi
+          if [ "$PLATFORM" = android ]; then
+            SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
+            [ -d "$SDK" ] || { echo "::error::Android SDK yok: $SDK"; exit 1; }
+            { echo "ANDROID_HOME=$SDK"; echo "ANDROID_SDK_ROOT=$SDK"; } >> "$GITHUB_ENV"
+            echo "🤖 ANDROID_HOME=$SDK"
+          fi
+          STALE=""
+          for P in $(pgrep -f 'GradleDaemon|KotlinCompileDaemon' 2>/dev/null || true); do
+            case "$(ps -o comm= -p "$P" 2>/dev/null)" in
+              */java) STALE="$STALE $P" ;;
+            esac
+          done
+          if [ -n "$STALE" ]; then
+            # shellcheck disable=SC2086
+            kill $STALE 2>/dev/null || true
+            echo "🧹 artık JVM daemon'ları kapatıldı:$STALE"
+          fi
+          rm -rf "${TMPDIR:-/tmp}/eas-build-local-nodejs" 2>/dev/null || true
+
+      # Lock dosyasından saptama. Birden fazla lock varsa en son commit'lenen kazanır.
+      # install-command doluysa hiç karışılmaz.
+      - name: Paket yöneticisi
+        id: pm
+        env:
+          PM_INPUT: ${{ inputs.package-manager }}
+          INSTALL_INPUT: ${{ inputs.install-command }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PM="$PM_INPUT"
+          INSTALL="$INSTALL_INPUT"
+          if [ -n "$INSTALL" ]; then
+            PM="${PM:-npm}"
+            echo "📦 install-command elle verildi: $INSTALL"
+          elif [ -z "$PM" ]; then
+            NEWEST=-1; FOUND=""
+            for L in package-lock.json yarn.lock pnpm-lock.yaml bun.lockb bun.lock; do
+              [ -f "$L" ] || continue
+              FOUND="$FOUND $L"
+              T="$(git log -1 --format=%ct -- "$L" 2>/dev/null || true)"; T="${T:-0}"
+              if [ "$T" -gt "$NEWEST" ]; then
+                NEWEST="$T"
+                case "$L" in
+                  bun.*) PM=bun ;;
+                  pnpm-lock.yaml) PM=pnpm ;;
+                  yarn.lock) PM=yarn ;;
+                  package-lock.json) PM=npm ;;
+                esac
+              fi
+            done
+            if [ -z "$PM" ]; then
+              echo "::warning::lock dosyası yok; npm install ile devam"
+              PM=npm; INSTALL="npm install"
+            elif [ "$(echo "$FOUND" | wc -w)" -gt 1 ]; then
+              echo "::warning::birden fazla lock dosyası:$FOUND — en son commit'lenen ($PM) kullanılıyor; kullanılmayanı depodan sil"
+            fi
+          fi
+          if [ -z "$INSTALL" ]; then
+            case "$PM" in
+              bun) INSTALL="bun install --frozen-lockfile" ;;
+              pnpm) INSTALL="pnpm install --frozen-lockfile" ;;
+              yarn) if [ -f .yarnrc.yml ]; then INSTALL="yarn install --immutable"; else INSTALL="yarn install --frozen-lockfile"; fi ;;
+              npm) INSTALL="npm ci" ;;
+              *) echo "::error::bilinmeyen paket yöneticisi: $PM (bun, pnpm, yarn, npm)"; exit 1 ;;
+            esac
+          fi
+          CACHE="$PM"; [ "$PM" = bun ] && CACHE=""
+          { echo "pm=$PM"; echo "install=$INSTALL"; echo "cache=$CACHE"; } >> "$GITHUB_OUTPUT"
+          echo "📦 $PM → $INSTALL"
+
+      - uses: pnpm/action-setup@v4
+        if: steps.pm.outputs.pm == 'pnpm'
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.pm.outputs.pm == 'bun'
+
+      # Self-hosted'da store zaten diskte kalıcı; cache yalnız GitHub-hosted'da anlamlı.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ runner.environment == 'github-hosted' && steps.pm.outputs.cache || '' }}
+
+      - name: corepack (yarn)
+        if: steps.pm.outputs.pm == 'yarn'
+        run: corepack enable
+
+      # Workspace'lerde alt paket tek başına kurulamaz: kurulum repo kökünde.
+      - name: Bağımlılıkları kur
+        env:
+          INSTALL: ${{ steps.pm.outputs.install }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          eval "$INSTALL"
+
+      - uses: expo/expo-github-action@v8
+        with:
+          eas-version: ${{ inputs.eas-cli-version }}
+          token: ${{ secrets.EXPO_TOKEN }}
+          packager: npm
+
+      - name: eas whoami
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: eas whoami
+
+      # launchd altındaki runner'da login keychain kilitlidir. Yarım kalan build'lerin
+      # bıraktığı "Distribution" sertifikaları codesign'ı ikilemde bırakır (xcodebuild exit 65);
+      # eas build kendi sertifikasını yeniden içe aktaracağı için önce onlar silinir.
+      - name: Keychain (iOS, self-hosted)
+        if: matrix.platform == 'ios' && runner.os == 'macOS' && inputs.unlock-keychain
+        env:
+          KC_PASSWORD: ${{ secrets.RUNNER_KC_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$KC_PASSWORD" ]; then
+            echo "::error::RUNNER_KC_PASSWORD boş: login keychain açılamaz. Sırrı ekle ya da GitHub-hosted runner'da unlock-keychain: false ver."
+            exit 1
+          fi
+          KC="$HOME/Library/Keychains/login.keychain-db"
+          security default-keychain -s "$KC"
+          security list-keychains -d user -s "$KC"
+          security unlock-keychain -p "$KC_PASSWORD" "$KC"
+          security set-keychain-settings "$KC"
+          HASHES="$(security find-certificate -a -c Distribution -Z "$KC" 2>/dev/null | grep -oE '[0-9A-F]{40}' || true)"
+          for H in $HASHES; do
+            security delete-certificate -Z "$H" "$KC" >/dev/null 2>&1 && echo "🗑️  artık sertifika $H"
+          done
+          echo "🔓 keychain hazır"
+
+      # eas-cli çalışma ağacını .gitignore'a uyarak kopyalar: yok sayılan native klasörler
+      # derlemeye girmez ve eas build prebuild'i kendisi yapar. Bu adım yalnız android/ ve ios/
+      # commit'li projeler için (app.json'daki güncel sürüm numaralarını yansıtmak).
+      - name: expo prebuild --clean
+        if: inputs.clean-prebuild
+        working-directory: ${{ needs.plan.outputs.app-dir }}
+        run: npx expo prebuild --platform "$PLATFORM" --clean --no-install
+
+      # <repo>-<platform>-<ref>.<uzantı>; uzantı profilin android.buildType'ından (extends zinciri
+      # izlenir). ref içindeki / işaretleri - olur (feature/x).
+      - name: Çıktı adı
+        id: out
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$PLATFORM" = ios ]; then
+            EXT=ipa
+          else
+            EXT="$(node -e '
+              const j = require(process.cwd() + "/" + process.env.APP_DIR + "/eas.json");
+              let p = process.env.PROFILE, bt; const seen = new Set();
+              while (p && !seen.has(p)) { seen.add(p); const b = (j.build || {})[p] || {}; bt = bt ?? (b.android || {}).buildType; p = b.extends; }
+              console.log(bt === "apk" ? "apk" : "aab");
+            ')"
+          fi
+          NAME="$REPO_NAME-$PLATFORM-${REF_NAME//\//-}.$EXT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "📦 $NAME"
+
+      # Sayaç (versionCode/buildNumber) EAS'ta olabilir; burada yalnız kullanıcıya görünen
+      # version ile tag karşılaştırılır. Uyuşmazlık uyarıdır, derleme sürer.
+      - name: Sürüm ve tag uyumu
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: ${{ needs.plan.outputs.app-dir }}
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          V="$(npx expo config --json --type public 2>/dev/null | node -e 'let d="";process.stdin.on("data",(c)=>d+=c).on("end",()=>{try{console.log(JSON.parse(d).version||"")}catch{console.log("")}})')"
+          T="${REF_NAME#v}"
+          if [ -n "$V" ] && [ "$V" != "$T" ]; then
+            echo "::warning::app version $V ile tag $REF_NAME uyuşmuyor"
+          else
+            echo "✅ version ${V:-?} · tag $REF_NAME"
+          fi
+
+      # Anahtar ve profil EAS'tan iner (EXPO_TOKEN). --non-interactive var olmayan anahtarı
+      # üretmez: ilk anahtar bir kez yerelde interaktif oluşturulur (README).
+      - name: eas build --local
+        working-directory: ${{ needs.plan.outputs.app-dir }}
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          OUT_NAME: ${{ steps.out.outputs.name }}
+          REFRESH_ADHOC: ${{ inputs.refresh-adhoc-profile }}
+          ASC_KEY_BASE64: ${{ secrets.ASC_KEY_BASE64 }}
+          EXPO_ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          EXPO_ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          EXPO_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          EXPO_APPLE_TEAM_TYPE: ${{ inputs.apple-team-type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist-ci"
+          EXTRA=""
+          if [ "$PLATFORM" = ios ] && [ "$REFRESH_ADHOC" = true ]; then
+            if [ -z "$ASC_KEY_BASE64" ] || [ -z "$EXPO_ASC_KEY_ID" ] || [ -z "$EXPO_ASC_ISSUER_ID" ]; then
+              echo "::error::refresh-adhoc-profile için ASC_KEY_BASE64, ASC_KEY_ID ve ASC_ISSUER_ID gerekir"
+              exit 1
+            fi
+            echo "$ASC_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/asc-api-key.p8"
+            export EXPO_ASC_API_KEY_PATH="$RUNNER_TEMP/asc-api-key.p8"
+            EXTRA="--refresh-ad-hoc-provisioning-profile"
+          fi
+          # shellcheck disable=SC2086
+          eas build --platform "$PLATFORM" --profile "$PROFILE" --local --non-interactive \
+            --output "$GITHUB_WORKSPACE/dist-ci/$OUT_NAME" $EXTRA
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.platform }}
+          path: dist-ci/*
+          retention-days: ${{ inputs.artifact-retention-days }}
+          if-no-files-found: error
+
+      - name: Temizlik
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/asc-api-key.p8"
+          if [ "$RUNNER_OS" = macOS ]; then
+            STALE=""
+            for P in $(pgrep -f 'GradleDaemon|KotlinCompileDaemon' 2>/dev/null || true); do
+              case "$(ps -o comm= -p "$P" 2>/dev/null)" in
+                */java) STALE="$STALE $P" ;;
+              esac
+            done
+            if [ -n "$STALE" ]; then
+              # shellcheck disable=SC2086
+              kill $STALE 2>/dev/null || true
+              echo "🧹 JVM daemon'ları kapatıldı:$STALE"
+            fi
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 3) RELEASE — yalnız release=auto ve ref bir tag ise. Artifact'ler tag'in Release'ine eklenir.
+  # ---------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && inputs.release == 'auto' && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      url: ${{ steps.gh.outputs.url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: dist-ci
+
+      - uses: softprops/action-gh-release@v2
+        id: gh
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: dist-ci/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

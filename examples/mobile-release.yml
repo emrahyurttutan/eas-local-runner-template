@@ -1,0 +1,31 @@
+# Tüketici depo örneği: tag'de APK (ve istenirse IPA) üretir, GitHub Release'e ekler.
+# Depo sırları: EXPO_TOKEN (zorunlu), RUNNER_KC_PASSWORD (iOS, self-hosted Mac).
+name: Mobil sürüm
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'android, ios ya da android,ios'
+        type: string
+        default: android
+
+# Bir grupta en fazla bir çalışan ve bir bekleyen sürüm olur; üçüncü tetikleme bekleyeni iptal eder.
+concurrency:
+  group: mobile-release
+  cancel-in-progress: false
+
+jobs:
+  mobile:
+    uses: emrahyurttutan/eas-local-runner-template/.github/workflows/eas-build.yml@main
+    permissions:
+      contents: write
+    with:
+      app-dir: apps/mobile
+      platforms: ${{ inputs.platforms || 'android' }}
+      profile: production
+    secrets:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      RUNNER_KC_PASSWORD: ${{ secrets.RUNNER_KC_PASSWORD }}
