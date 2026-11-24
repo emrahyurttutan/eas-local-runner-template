@@ -71,8 +71,10 @@ release   yalnız ref bir tag ise: artifact'ler → GitHub Release
 
 - `build` job'ları platform başına ayrıdır ve biri düşerse diğeri sürer (`fail-fast: false`).
   Release yalnız hepsi başarılıysa oluşur.
-- Tek self-hosted runner job'ları zaten sırayla çalıştırır; şablon ayrıca `concurrency`
-  tanımlamaz. Tüketici iş akışındaki `concurrency` grubu, iki tag'in iç içe girmesini önler.
+- Tüketici iş akışındaki `concurrency` grubu, aynı deponun iki tag'inin iç içe girmesini önler.
+  Depolar ve runner'lar arası sıralamayı **makine kilidi** sağlar: aynı Mac'te birden çok
+  runner (başka depolar, GitLab şablonu) varsa her `build` job'ı önce `/tmp/eas-local-build.lock`
+  kilidini alır ve diğer derleme bitene kadar bekler. Bekleme `timeout-minutes`'a sayılır.
   GitHub kuralı: bir grupta en fazla **bir çalışan ve bir bekleyen** iş olur; üçüncü tetikleme
   bekleyeni iptal eder. İptal edilen tag için iş akışı Actions sekmesinden yeniden çalıştırılır.
 
@@ -152,10 +154,18 @@ release   yalnız ref bir tag ise: artifact'ler → GitHub Release
 - **GitHub-hosted'a geçiş.** `runs-on: '["macos-15"]'` ve `unlock-keychain: false`. Private
   depoda macOS dakikası 10 kat sayılır; Expo bağımlılıkları her seferinde sıfırdan kurulur.
 - **Keychain.** iOS job'ı başlamadan login keychain açılır ve `Distribution` adlı artık
-  sertifikalar silinir; `eas build` kendi sertifikasını yeniden içe aktarır.
-- **JVM daemon'ları.** Job öncesi ve sonrası `GradleDaemon` / `KotlinCompileDaemon` süreçleri
-  kapatılır. Runner aynı zamanda geliştirme makinesiyse bu, bir sonraki build'in
-  `OutOfMemoryError: Metaspace` ile düşmesini önler.
+  sertifikalar silinir; `eas build` kendi sertifikasını yeniden içe aktarır. Arama listesi sıfırlanmaz:
+  login başa alınır, dosyası duran diğer kayıtlar (başka bir derlemenin geçici keychain'i) korunur;
+  yarım kalmış EAS derlemelerinin `eas-build-<uuid>.keychain` kayıtları, başka bir EAS derlemesi
+  koşmuyorsa çıkarılır.
+- **Makine kilidi.** `/tmp/eas-local-build.lock`, GitLab şablonuyla ortak. Sahibi job'ın
+  `Runner.Worker` sürecidir; job biterse ya da öldürülürse kilit sahipsiz kalır ve sonraki job kaldırır; `Temizlik`
+  adımı da bırakır. Keychain ve daemon adımları yalnız kilit alındıktan sonra çalışır.
+- **JVM daemon'ları.** Job öncesi ve sonrası (kilit bu job'dayken) `GradleDaemon` /
+  `KotlinCompileDaemon` süreçleri kapatılır. Runner aynı zamanda geliştirme makinesiyse bu, bir sonraki build'in
+  `OutOfMemoryError: Metaspace` ile düşmesini önler. Kilidi paylaşmayan bir derleme (Zeyrek
+  mobile-runner, elle `eas build --local`) sürüyorsa — koşan bir `gradlew`, `xcodebuild` ya da EAS
+  yerel derlemesi varsa — temizlik atlanır.
 - **Artifact ve Release.** Artifact adı `build-<platform>`; Release yalnız `release: auto` ve
   ref `refs/tags/*` iken oluşur, `generate_release_notes` açıktır.
 
